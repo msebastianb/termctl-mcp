@@ -1,0 +1,11 @@
+{
+  "task": "T3_menu",
+  "condition": "MCP termctl",
+  "duration_s": 420.0,
+  "usage": {},
+  "verdict": {
+    "verified": false,
+    "error": "list index out of range"
+  },
+  "window": null
+}

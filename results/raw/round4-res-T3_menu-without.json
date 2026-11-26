@@ -1,0 +1,14 @@
+{
+  "task": "T3_menu",
+  "condition": "no tool",
+  "duration_s": 420.0,
+  "usage": {},
+  "verdict": {
+    "verified": false,
+    "expected": "ultima scelta: tre",
+    "seen": [
+      "ultima scelta: -"
+    ]
+  },
+  "window": 1223
+}

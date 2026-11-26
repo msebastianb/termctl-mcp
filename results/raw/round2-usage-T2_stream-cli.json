@@ -1,0 +1,47 @@
+{
+  "estimated_cost_usd": 0.0,
+  "cost_status": "unknown",
+  "cost_source": "none",
+  "input_tokens": 163223,
+  "output_tokens": 619,
+  "cache_read_tokens": 137395,
+  "cache_write_tokens": 0,
+  "reasoning_tokens": 0,
+  "total_tokens": 163842,
+  "api_calls": 8,
+  "model": "Inkling-2-Mini-UD-Q4_K_XL",
+  "provider": "custom",
+  "session_id": "local-a17677e31d9d9c6f8fed885673b7aaff188310fa8a7d0cbe62893135c0b04c0f",
+  "completed": true,
+  "partial": false,
+  "interrupted": false,
+  "turn_exit_reason": "text_response(finish_reason=stop)",
+  "failed": false,
+  "service_tier": null,
+  "auxiliary": {
+    "api_calls": 1,
+    "input_tokens": 4,
+    "output_tokens": 205,
+    "cache_read_tokens": 372,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 0,
+    "estimated_cost_usd": 0,
+    "total_tokens": 209,
+    "by_task": {
+      "title_generation": {
+        "api_calls": 1,
+        "cache_read_tokens": 372,
+        "cache_write_tokens": 0,
+        "estimated_cost_usd": 0,
+        "input_tokens": 4,
+        "output_tokens": 205,
+        "reasoning_tokens": 0
+      }
+    }
+  },
+  "total_including_auxiliary": {
+    "estimated_cost_usd": 0.0,
+    "total_tokens": 164051,
+    "api_calls": 9
+  }
+}

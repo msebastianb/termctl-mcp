@@ -1,0 +1,39 @@
+{
+  "wired_gb": {
+    "mean": 3.75,
+    "max": 3.75
+  },
+  "compressor_gb": {
+    "mean": 15.53,
+    "max": 15.53
+  },
+  "gpu_util_pct": {
+    "mean": 39.4,
+    "max": 46
+  },
+  "gpu_mem_mb": {
+    "mean": 1155.64,
+    "max": 1156.9
+  },
+  "swap_used_mb": {
+    "mean": 4230.25,
+    "max": 4230.25
+  },
+  "llama_rss_gb": {
+    "mean": 1.92,
+    "max": 1.92
+  },
+  "llama_cpu_pct": {
+    "mean": 0.08,
+    "max": 0.1
+  },
+  "load1": {
+    "mean": 4.25,
+    "max": 4.25
+  },
+  "free_mb": {
+    "mean": 288.2,
+    "max": 291
+  },
+  "thermal_peak": "nominal"
+}

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>termctl benchmark</title>
+<style>
+  :root { --ink: #111; --dim: #666; --line: #ddd; --fill: #111; --fill2: #999; }
+  body { margin: 0 auto; padding: 24px; max-width: 760px; background: #fff; color: var(--ink);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 21px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 26px 0 8px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+  table { border-collapse: collapse; font-size: 13.5px; width: 100%; margin: 6px 0 14px; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .track { background: #eee; height: 22px; border-radius: 3px; position: relative; margin: 3px 0; }
+  .fill { background: var(--fill); height: 22px; border-radius: 3px; }
+  .fill2 { background: var(--fill2); height: 22px; border-radius: 3px; }
+  .v { position: absolute; left: 8px; top: 2px; font-size: 12.5px; color: #fff; }
+  .lbl { font-size: 12.5px; color: var(--dim); margin: 12px 0 2px; }
+  .note { color: var(--dim); font-size: 13px; }
+  code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+  <h1>Does an interface to a terminal help a small local model?</h1>
+  <div class="sub">Inkling-2-Mini UD-Q4_K_XL (≈5.4B active) on an M5 Pro, driving a real Terminal.app
+    session — same model, same prompt, only the interface changes.</div>
+
+  <h2>1 · Identify which sessions are open</h2>
+  <div class="lbl">wall time (lower is better)</div>
+  <div class="track" style="max-width:155px"><div class="fill" style="width:67%"></div><span class="v">with the tool · 104.7 s</span></div>
+  <div class="track" style="max-width:155px"><div class="fill2" style="width:100%"></div><span class="v">without · 155.5 s · +49%</span></div>
+  <div class="lbl">tokens</div>
+  <div class="track" style="max-width:133px"><div class="fill" style="width:63%"></div><span class="v">with the tool · 83,339</span></div>
+  <div class="track" style="max-width:133px"><div class="fill2" style="width:100%"></div><span class="v">without · 133,099 · +60%</span></div>
+
+  <h2>2 · Follow a long-running stream to completion</h2>
+  <div class="note">
+    with the tool: <strong>finished in 141.4 s · 124,077 tokens</strong><br>
+    without: <strong>never finished</strong> — stopped at the 420 s cap (twice)
+  </div>
+
+  <h2>3 · Answer a menu inside a TUI</h2>
+  <div class="note">
+    with the tool: <strong>choice landed</strong> (independent judge read it from the window) · 78.9–98.1 s<br>
+    without: <strong>choice never landed</strong> — 420 s cap, judge: FAIL
+  </div>
+
+  <h2>Machine load</h2>
+  <table>
+    <tr><th></th><th class="num">idle</th><th class="num">with the tool</th><th class="num">without</th></tr>
+    <tr><td>RAM wired</td><td class="num">3.8 GB</td><td class="num">27.9–28.7 GB</td><td class="num">28.1–28.7 GB</td></tr>
+    <tr><td>GPU memory in use</td><td class="num">1.2 GB</td><td class="num">25.4–26.2 GB</td><td class="num">25.6 GB</td></tr>
+    <tr><td>GPU utilisation</td><td class="num">39%</td><td class="num">100%</td><td class="num">100%</td></tr>
+    <tr><td>Swap used</td><td class="num">4.2 GB</td><td class="num">5.3–6.5 GB</td><td class="num">5.5–6.5 GB</td></tr>
+    <tr><td>Thermal state</td><td class="num">nominal</td><td class="num">nominal–fair</td><td class="num">nominal–fair</td></tr>
+  </table>
+  <div class="note">Identical in both conditions: the cost is the resident model, not the interface.</div>
+
+  <h2>Biggest single win came from wording, not code</h2>
+  <div class="note">
+    Telling the model to prefer the MCP tools and to <em>wait</em> (<code>wait_for</code>) instead of
+    polling cut the stream task from <strong>225,124 → 124,077 tokens</strong> (−45%), same correct answer.
+  </div>
+</body>
+</html>

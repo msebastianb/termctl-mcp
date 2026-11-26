@@ -1,0 +1,83 @@
+{
+  "task": "T3_menu",
+  "condition": "shell only",
+  "duration_s": 78.9,
+  "usage": {
+    "estimated_cost_usd": 0.0,
+    "cost_status": "unknown",
+    "cost_source": "none",
+    "input_tokens": 109143,
+    "output_tokens": 351,
+    "cache_read_tokens": 100187,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 0,
+    "total_tokens": 109494,
+    "api_calls": 5,
+    "model": "Inkling-2-Mini-UD-Q4_K_XL",
+    "provider": "custom",
+    "session_id": "local-cab70a4a1726ded4598a738abda1223aac98ba261f7b741492883ab814644309",
+    "completed": true,
+    "partial": false,
+    "interrupted": false,
+    "turn_exit_reason": "text_response(finish_reason=stop)",
+    "failed": false,
+    "service_tier": null,
+    "auxiliary": {
+      "api_calls": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0,
+      "estimated_cost_usd": 0,
+      "total_tokens": 0,
+      "by_task": {}
+    },
+    "total_including_auxiliary": {
+      "estimated_cost_usd": 0.0,
+      "total_tokens": 109494,
+      "api_calls": 5
+    }
+  },
+  "stderr_tail": "",
+  "load": {
+    "wired_gb": {
+      "mean": 27.5,
+      "max": 27.69
+    },
+    "compressor_gb": {
+      "mean": 11.73,
+      "max": 13.13
+    },
+    "gpu_util_pct": {
+      "mean": 95.54,
+      "max": 100
+    },
+    "gpu_mem_mb": {
+      "mean": 25029.93,
+      "max": 25226.4
+    },
+    "swap_used_mb": {
+      "mean": 6453.38,
+      "max": 6453.38
+    },
+    "llama_rss_gb": {
+      "mean": 3.14,
+      "max": 3.6
+    },
+    "llama_cpu_pct": {
+      "mean": 18.22,
+      "max": 60.8
+    },
+    "load1": {
+      "mean": 2.9,
+      "max": 3.32
+    },
+    "free_mb": {
+      "mean": 307.3,
+      "max": 795
+    },
+    "thermal_peak": "nominal"
+  },
+  "samples": 37
+}

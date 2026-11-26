@@ -1,0 +1,1435 @@
+#!/usr/bin/env python3
+"""termctl - drives Terminal.app sessions with ONE command per action.
+
+Built for an agent (even a small local model) that has to open, read and
+write in a terminal session without hand-writing AppleScript: no
+quotes to escape, no double "do script" to press Return, compact JSON output
+on a single line.
+
+  termctl list                          open sessions: id, tty, busy, title
+  termctl info  <id> [-n 8]             identify a session: processes on the tty,
+                                        cwd, size, last lines
+  termctl status <id>                   idle? working? WAITING for an answer?
+                                        (question + menu options, seconds motionless)
+  termctl brief <id>                    rehydration in one call: which window it is,
+                                        what we asked it, last output, state
+  termctl search "text" [-n 3]          searches ALL sessions and says which one has it
+  termctl read  <id> [-n 40]            last lines of that session
+  termctl read  <id> --grep PATTERN     only the lines containing PATTERN
+  termctl delta <id> [-n 60] [--reset]  ONLY the new lines since last time
+  termctl send  <id> "text" [--wait-for P] [--timeout N]
+                                        writes, presses Return and (with --wait-for) waits
+                                        for the marker: one call instead of three
+  termctl run   <id> "command" [-n 60]  sends, waits, returns exit code + output:
+                                        one call instead of send+wait+read
+  termctl choose <id> 2 | "Yes"          picks an entry of a TUI menu (arrows + Return)
+  termctl key   <id> ctrl-c|up|esc|...  one single key (arrows and ctrl-* included)
+  termctl new   [--preset P] [--cmd C] [--dir D]   opens a window and prints its id
+  termctl title <id> "name"             renames the window: so `list` says which one it is
+  termctl close <id> [--force]          closes the window (useful: don't pile up sessions)
+  termctl watch <id> [-n 40] [--idle 4] [--timeout 120]   waits for the output to settle
+  termctl wait-for <id> "pattern" [--timeout 300] [--interval 2]   waits for a marker
+  termctl ask   "question" [--agent claude|copilot] [--model M] [--dir D]
+                                        a direct question to a CLI agent, in a throwaway
+                                        window (it closes itself)
+  termctl presets                       lists the presets used by --preset
+  termctl mcp                           MCP server on stdio: one tool per verb, so
+                                        they can be switched on/off one at a time
+
+Ready-made presets (the real list comes from `termctl presets`):
+  copilot-opus   copilot --model claude-opus-5.5 --reasoning-effort high --autopilot
+  copilot        copilot --autopilot
+  claude         Claude Code, default model
+  claude-opus    claude --model opus      (also claude-fable / claude-sonnet)
+  copilot-yolo   copilot --autopilot --allow-all        <- no confirmation
+  claude-yolo    claude --dangerously-skip-permissions  <- no confirmation
+  shell          interactive shell in $HOME
+
+Note on bytes: Terminal's do script ALWAYS appends a Return at the end of what
+it writes. So one write = one Return, and key sequences are sent in
+a single call (`choose` does that); `key` is for one single key at a time.
+Arrows are sent in the form the session's TERM expects (for
+xterm-256color it is ESC O B, not ESC [ B: the latter is ignored and the menu
+stays still): it is read from the terminfo of the foreground process, --csi forces it.
+
+Examples:
+  termctl new --preset copilot-opus --title "copilot - my-project"
+  termctl brief 512                            -> where we were, in one call
+  termctl status 512                           -> {"state": "waiting_for_input", "question": "...", "options": [...]}
+  termctl choose 512 2                         -> answers "2." of the menu and waits for a change
+  termctl send 512 "add the tests for parse_config" --wait-for "Task complete" --timeout 900
+  termctl delta 512                            -> only what showed up after
+  termctl run 512 "git status --short"         -> {"exit_code": 0, "output": [...]}
+  termctl search "Task complete"               -> {"found_in": 1, "sessions": [{"id": 512, ...}]}
+  termctl info 512 / read 512 --grep "error" / key 512 ctrl-c / close 512
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+OSA = "/usr/bin/osascript"
+US = "\x1f"
+DEFAULT_LINES = 40
+MAX_LINE_CHARS = 300
+STATE = os.path.expanduser("~/.local/state/termctl-state.json")
+
+PRESETS = {
+    "copilot-opus": "copilot --model claude-opus-5.5 --reasoning-effort high --autopilot",
+    "copilot": "copilot --autopilot",
+    "copilot-yolo": "copilot --model claude-opus-5.5 --reasoning-effort high --autopilot --allow-all",
+    "claude": "claude",
+    "claude-opus": "claude --model opus",
+    "claude-fable": "claude --model fable",
+    "claude-sonnet": "claude --model sonnet",
+    "claude-yolo": "claude --model opus --dangerously-skip-permissions",
+    "shell": "exec $SHELL -l",
+}
+
+# Presets that remove EVERY confirmation: they exist, but are not used without telling the user.
+YOLO_PRESETS = ("copilot-yolo", "claude-yolo")
+
+# Recognised CLI agents (by process name / command line).
+AGENTS = ("copilot", "claude", "codex", "opencode", "gemini", "aider", "cursor-agent")
+
+# Text that means "I am not authenticated": it is reported, never fixed on our own.
+LOGIN_HINTS = ("not logged in", "please run /login", "/login", "log in to", "sign in")
+
+# int = single ASCII code; str = sequence after ESC (arrows & co.)
+KEYS = {
+    "ctrl-c": 3, "ctrl-d": 4, "ctrl-a": 1, "ctrl-e": 5, "ctrl-k": 11, "ctrl-l": 12,
+    "ctrl-r": 18, "ctrl-u": 21, "ctrl-w": 23, "ctrl-x": 24, "ctrl-z": 26,
+    "esc": 27, "enter": 13, "tab": 9, "shift-tab": "[Z", "backspace": 127, "space": 32,
+    "up": "[A", "down": "[B", "right": "[C", "left": "[D",
+}
+
+SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "nu", "login", "-zsh", "-bash"}
+
+# Phrases that in a TUI mean "I am waiting for you to choose".
+PROMPT_HINTS = (
+    "enter to select", "to navigate", "esc to cancel", "to confirm", "↑/↓",
+    "[y/n]", "[y/N]", "(y/n)", "(y/N)", "(Y/n)", "press any key", "press enter",
+    "continue?", "are you sure", "do you want", "do you trust", "shall i",
+    "allow?", "permission", "select an option", "choose an option", "input required",
+    "waiting for", "your choice",
+    # entries typical of agent CLIs (Claude Code, Copilot)
+    "(esc)", "esc to interrupt", "ctrl+c to interrupt", "do you want to proceed",
+    "don't ask again", "tell claude", "tell copilot", "allow once", "allow this",
+    "allow command", "trust the files", "keep going",
+)
+
+# Markers of "this is the selected entry" (❯ in Claude Code, ▶ elsewhere).
+MARKERS = "❯▶»●◉★✦"
+OPT_RE = re.compile(r"^(\d+)[.)]\s+(.+)$")
+BOX_CHARS = "│|╭╰─┌└╮╯╱╲┃"
+
+
+def die(msg, **extra):
+    print(json.dumps({"ok": False, "error": msg, **extra}, ensure_ascii=False))
+    sys.exit(1)
+
+
+def osa(script, timeout=45):
+    """Runs AppleScript. On a permission error it prints the way out."""
+    try:
+        p = subprocess.run([OSA, "-e", script], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        die(f"osascript did not answer within {timeout}s (Terminal busy or window blocked)")
+    if p.returncode != 0:
+        err = (p.stderr or "").strip()
+        hint = None
+        # macOS reports the Automation error in the system language: match both wordings.
+        if ("-1743" in err or "not allowed" in err.lower()
+                or "authorization" in err.lower() or "autorizzazione" in err.lower()):
+            hint = ("missing the Automation permission for Terminal: System Settings > "
+                    "Privacy & Security > Automation > (calling process) > Terminal")
+        die(err or "osascript failed", hint=hint)
+    return p.stdout.strip()
+
+
+def astr(s):
+    """Literal AppleScript string, correctly escaped."""
+    out = s.replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + out.replace("\n", "\\n").replace("\r", "") + '"'
+
+
+def _key_expr(v):
+    if isinstance(v, int):
+        return f"(ASCII character {v})"
+    return f'((ASCII character 27) & {astr(v)})'
+
+
+def _history(win_id, timeout=60):
+    return osa(f'tell application "Terminal" to get history of tab 1 of window id {win_id}', timeout=timeout)
+
+
+def _busy(win_id):
+    try:
+        return osa(f'tell application "Terminal" to get busy of tab 1 of window id {win_id}',
+                   timeout=20).strip().lower() == "true"
+    except SystemExit:
+        return None
+
+
+ARROW_CAPS = {"up": ("kcuu1", "[A"), "down": ("kcud1", "[B"),
+              "left": ("kcub1", "[D"), "right": ("kcuf1", "[C")}
+_TERM_CACHE = {}
+
+
+def _osa_expr(data):
+    """AppleScript expression that produces exactly these bytes."""
+    return " & ".join(f"(ASCII character {b})" for b in data)
+
+
+def _unescape_cap(val):
+    """From \\EOB (infocmp notation) to the actual bytes."""
+    out, i = bytearray(), 0
+    val = val.strip().strip("'\"")
+    simple = {"E": 27, "e": 27, "n": 10, "r": 13, "t": 9, "\\": 92, "a": 7, "b": 8, "f": 12, "v": 11}
+    while i < len(val):
+        c = val[i]
+        if c == "\\" and i + 1 < len(val):
+            n = val[i + 1]
+            if n in simple:
+                out.append(simple[n]); i += 2; continue
+            if n.isdigit():
+                j, num = i + 1, ""
+                while j < len(val) and val[j].isdigit() and len(num) < 3:
+                    num += val[j]; j += 1
+                out.append(int(num, 8) & 0xFF); i = j; continue
+            i += 2; continue
+        if c == "^" and i + 1 < len(val):
+            out.append(ord(val[i + 1].upper()) - 64); i += 2; continue
+        out.extend(c.encode()); i += 1
+    return bytes(out)
+
+
+def _fg_term(win_id):
+    """The TERM the foreground process of that session runs with."""
+    try:
+        tty = _window_meta(win_id)["tty"]
+        procs = _procs_on_tty(tty)
+        if not procs:
+            return None
+        out = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(procs[-1]["pid"])],
+                             capture_output=True, text=True, timeout=10,
+                             stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return None
+    m = re.search(r"\bTERM=([A-Za-z0-9._+-]+)", out)
+    return m.group(1) if m else None
+
+
+def _cap_bytes(term, cap):
+    """The bytes terminfo expects for that capability (e.g. kcud1)."""
+    if not term:
+        return None
+    key = (term, cap)
+    if key in _TERM_CACHE:
+        return _TERM_CACHE[key]
+    data = None
+    try:
+        out = subprocess.run(["infocmp", "-1", term], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL).stdout
+        m = re.search(rf"^\s*{cap}=([^,]+),", out, re.M)
+        if m:
+            data = _unescape_cap(m.group(1))
+    except Exception:
+        data = None
+    _TERM_CACHE[key] = data
+    return data
+
+
+def _key_data(win_id, name, force_csi=False):
+    """(bytes, form) to send for a key.
+
+    Arrows can NOT be hard-coded: for xterm-256color terminfo says
+    kcud1=ESC O B (SS3 form) and a plain ESC [ B is ignored as a raw byte — a
+    menu stays still and it looks like the arrow never arrived. So we read
+    the TERM of the foreground process and use its form; --csi forces
+    l'altra.
+    """
+    name = name.lower()
+    if name in ARROW_CAPS:
+        cap, fallback = ARROW_CAPS[name]
+        if force_csi:
+            return b"\x1b" + fallback.encode(), "csi (forced)"
+        data = _cap_bytes(_fg_term(win_id), cap)
+        if data:
+            return data, f"terminfo ({_fg_term(win_id)})"
+        return b"\x1b" + fallback.encode(), "csi (no terminfo)"
+    if name not in KEYS:
+        die(f"unsupported key: {name}", supported=sorted(KEYS))
+    v = KEYS[name]
+    return (bytes([v]) if isinstance(v, int) else b"\x1b" + v.encode()), "ascii"
+
+
+def _press(win_id, name, force_csi=False):
+    """One single key (carries a Return behind it: see _type)."""
+    data, form = _key_data(win_id, name, force_csi)
+    osa(f'tell application "Terminal" to do script {_osa_expr(data)} in tab 1 of window id {win_id}',
+        timeout=60)
+    return form
+
+
+def clean_lines(raw, n):
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    total = len(lines)
+    tail = lines[-n:] if n > 0 else lines
+    trunc = [ln[:MAX_LINE_CHARS] for ln in tail]
+    return total, trunc
+
+
+def _no_markers(lines):
+    return [ln for ln in lines if not re.search(r"__termctl_exit_\d+", ln)]
+
+
+def _fingerprint(line):
+    return hashlib.md5(line.strip().encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE)
+    except Exception:
+        pass
+
+
+def _touch_state(win_id, lines, total, title=None):
+    """Remembers the last line seen and SINCE WHEN it has been there: that is "motionless for N seconds"."""
+    state = _load_state()
+    key = str(win_id)
+    entry = state.get(key, {})
+    fp = _fingerprint(lines[-1]) if lines else None
+    if fp and fp != entry.get("last"):
+        entry["last"] = fp
+        entry["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    entry["total_lines"] = total
+    if title:
+        entry["title"] = title
+    state[key] = entry
+    _save_state(state)
+    return entry
+
+
+def _remember_ask(win_id, kind, text, exit_code=None):
+    """Keeps track of what we asked that session: used by `brief`."""
+    state = _load_state()
+    key = str(win_id)
+    entry = state.get(key, {})
+    asks = entry.get("asks", [])
+    asks.append({"at": time.strftime("%H:%M:%S"), "kind": kind, "text": text[:200],
+                 **({"exit_code": exit_code} if exit_code is not None else {})})
+    entry["asks"] = asks[-6:]
+    state[key] = entry
+    _save_state(state)
+
+
+def _quiet_seconds(win_id, lines):
+    """How many seconds the last line has not changed (None if unknown)."""
+    entry = _load_state().get(str(win_id), {})
+    if not lines or not entry.get("at") or entry.get("last") != _fingerprint(lines[-1]):
+        return None
+    try:
+        t = time.mktime(time.strptime(entry["at"], "%Y-%m-%dT%H:%M:%S"))
+        return int(time.time() - t)
+    except Exception:
+        return None
+
+
+def _plain(line):
+    """(text, was_selected): strips the borders and the selection marker."""
+    t = line.strip().strip(BOX_CHARS).strip()
+    sel = bool(t) and t[0] in MARKERS
+    if sel:
+        t = t[1:].strip()
+    return t, sel
+
+
+def _detect_prompt(lines):
+    """Recognises a TUI waiting for a choice: question + menu entries."""
+    pairs = [_plain(x) for x in lines[-25:]]
+    tail = [(t, sel) for t, sel in pairs if t]
+    # selection marker on an empty line = the input box of a TUI waiting
+    # for input (e.g. Copilot after "Task complete", Claude Code): it is not a menu,
+    # but the agent is parked there and waiting for an instruction.
+    idle_prompt = any(sel and not t for t, sel in pairs[-4:])
+    opts, hints = [], []
+    for t, sel in tail:
+        m = OPT_RE.match(t)
+        if m:
+            label = m.group(2).strip()
+            if label:
+                opts.append({"n": int(m.group(1)), "text": label[:100], "selected": sel})
+        low = t.lower()
+        if any(h.lower() in low for h in PROMPT_HINTS):
+            hints.append(t[:120])
+    plain = [t for t, _sel in tail]
+    question = None
+    for t in reversed(plain):
+        if OPT_RE.match(t) or any(h.lower() in t.lower() for h in PROMPT_HINTS):
+            continue
+        if t[-1:] in "?:":
+            question = t[:200]
+            break
+    if question is None:
+        for t in plain:
+            if OPT_RE.match(t) or any(h.lower() in t.lower() for h in PROMPT_HINTS):
+                continue
+            question = t[:200]
+            break
+    waiting = bool(opts) or bool(hints)
+    return {"waiting_for_input": waiting,
+            "question": question if waiting else None,
+            "options": opts if waiting else [],
+            "selected": next((i for i, o in enumerate(opts) if o.get("selected")), None),
+            "idle_prompt": idle_prompt,
+            "hints": hints[-2:]}
+
+
+def _agent_of(procs):
+    """Recognises a CLI agent from the processes of that session."""
+    for p in procs or []:
+        low = p["command"].lower()
+        for a in AGENTS:
+            if re.search(rf"(?:^|[\s/@-]){re.escape(a)}(?:[\s/-]|$)", low):
+                return a
+    return None
+
+
+def _login_required(lines):
+    low = "\n".join(lines[-25:]).lower()
+    return any(h in low for h in LOGIN_HINTS)
+
+
+def _tui_note(agent):
+    return (f"{agent} TUI: `busy` is the program, not the work — to know whether it is "
+            "working, look at quiet_s and waiting_for_input")
+
+
+def _state_label(busy, waiting):
+    if busy and waiting:
+        return "waiting_for_input"
+    if busy:
+        return "working"
+    if waiting:
+        return "idle_at_prompt"
+    return "ready"
+
+
+def sessions_list():
+    """Every Terminal.app window: id, tty, busy, title."""
+    raw = osa('''
+tell application "Terminal"
+    set out to ""
+    repeat with w in windows
+        set t to tab 1 of w
+        set out to out & (id of w as text) & (ASCII character 31) & (tty of t) & (ASCII character 31) & (busy of t as text) & (ASCII character 31) & (name of w as text) & linefeed
+    end repeat
+    return out
+end tell
+''')
+    sessions = []
+    for ln in raw.splitlines():
+        parts = ln.split(US)
+        if len(parts) >= 4:
+            sessions.append({"id": int(parts[0]), "tty": parts[1],
+                             "busy": parts[2].strip().lower() == "true",
+                             "title": parts[3][:120]})
+    return sessions
+
+
+def _window_meta(win_id):
+    raw = osa(f'''
+tell application "Terminal"
+    set w to window id {win_id}
+    set t to tab 1 of w
+    return (tty of t) & (ASCII character 31) & (busy of t as text) & (ASCII character 31) & (name of w as text) & (ASCII character 31) & (number of rows of t as text) & (ASCII character 31) & (number of columns of t as text)
+end tell
+''')
+    parts = raw.split(US)
+    return {"tty": parts[0], "busy": parts[1].strip().lower() == "true",
+            "title": parts[2][:120], "rows": int(parts[3]) if len(parts) > 3 else 0,
+            "cols": int(parts[4]) if len(parts) > 4 else 0}
+
+
+def _window_exists(win_id):
+    try:
+        return any(s["id"] == win_id for s in sessions_list())
+    except SystemExit:
+        return False
+
+
+def _procs_on_tty(tty):
+    """Processes with that terminal as stdin: who is running inside it."""
+    name = tty.replace("/dev/", "")
+    try:
+        p = subprocess.run(["ps", "-t", name, "-o", "pid=,ppid=,etime=,command="],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return []
+    out = []
+    for ln in p.stdout.splitlines():
+        parts = ln.strip().split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit():
+            out.append({"pid": int(parts[0]), "ppid": int(parts[1]),
+                        "etime": parts[2], "command": parts[3][:140]})
+    return out
+
+
+def _cwd_of(pid):
+    try:
+        p = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    for ln in p.stdout.splitlines():
+        if ln.startswith("n"):
+            return ln[1:]
+    return None
+
+
+def _type(win_id, text):
+    """Writes the text into the session (which executes it: Terminal adds the CR).
+
+    Terminal's `do script` ALWAYS appends a newline at the end of what
+    it writes (verified with a byte probe: after every write a
+    0d arrives), and there is no way around it: System Events is blocked by permissions
+    ("not allowed to send keystrokes", 1002) and writing to the tty device sends
+    the bytes to the session's DISPLAY, not to the program's stdin. So:
+    one write = one Return, and key sequences are sent in ONE single
+    call (`choose` does that); `key` is fine for one key at a time.
+    """
+    osa(f'tell application "Terminal" to do script {astr(text)} in tab 1 of window id {win_id}', timeout=60)
+
+
+def _enter(win_id, wait=0.0):
+    """Presses Return: a do script with empty text is a single CR."""
+    if wait:
+        time.sleep(wait)
+    osa(f'tell application "Terminal" to do script "" in tab 1 of window id {win_id}', timeout=60)
+
+
+def _snapshot(win_id):
+    """(meta, procs, fg, lines, total, detection, agent) in one go."""
+    meta = _window_meta(win_id)
+    procs = _procs_on_tty(meta["tty"])
+    fg = procs[-1] if procs else None
+    raw = _history(win_id)
+    total, lines = clean_lines(raw, 0)
+    return meta, procs, fg, lines, total, _detect_prompt(lines), _agent_of(procs)
+
+
+def cmd_list(_args):
+    sessions = sessions_list()
+    print(json.dumps({"ok": True, "count": len(sessions), "sessions": sessions}, ensure_ascii=False))
+    return sessions
+
+
+def cmd_info(args):
+    """Identifies a session without reading the whole scrollback."""
+    meta, procs, fg, lines, total, _det, agent = _snapshot(args.id)
+    _touch_state(args.id, lines, total, meta["title"])
+    print(json.dumps({
+        "ok": True, "id": args.id, "tty": meta["tty"], "busy": meta["busy"],
+        "title": meta["title"], "size": f'{meta["cols"]}x{meta["rows"]}',
+        "agent": agent,
+        "foreground": fg, "processes": procs[:6], "cwd": _cwd_of(fg["pid"]) if fg else None,
+        "total_lines": total, "shown": len(lines[-args.lines:]),
+        "last_lines": _no_markers(lines[-args.lines:]),
+    }, ensure_ascii=False))
+
+
+def cmd_status(args):
+    """Working, parked at the prompt, or WAITING for an answer?"""
+    meta, _procs, fg, lines, total, det, agent = _snapshot(args.id)
+    quiet = _quiet_seconds(args.id, lines)
+    _touch_state(args.id, lines, total, meta["title"])
+    waiting = det["waiting_for_input"] or bool(agent and det.get("idle_prompt"))
+    label = _state_label(meta["busy"], waiting)
+    out = {"ok": True, "id": args.id, "state": label, "busy": meta["busy"],
+           "waiting_for_input": waiting, "question": det["question"],
+           "options": det["options"], "selected": det.get("selected"), "quiet_s": quiet,
+           "idle_prompt": bool(det.get("idle_prompt")),
+           "title": meta["title"], "agent": agent,
+           "foreground": fg, "cwd": _cwd_of(fg["pid"]) if fg else None,
+           "last_lines": _no_markers(lines[-args.lines:])}
+    if det["hints"]:
+        out["hints"] = det["hints"]
+    if _login_required(lines):
+        out["login_required"] = True
+        out["note"] = ("the agent is not authenticated: it needs /login, do it yourself "
+                       "(I do not try credentials)")
+    elif agent and det.get("idle_prompt") and not det["options"]:
+        out["note"] = (f"{agent} is parked on its input box: it finished and waits for "
+                       "an instruction (it is not a menu to choose from)")
+    elif label == "waiting_for_input" and not det["options"]:
+        out["note"] = ("it looks like it waits for an answer but I see no numbered menu: "
+                       "read the last lines and decide yourself")
+    elif label == "working" and quiet is not None and quiet > args.stuck:
+        out["note"] = (f"busy but motionless for {quiet}s: it may be blocked "
+                       "(network, prompt off screen) — look with read")
+    elif agent:
+        out["note"] = _tui_note(agent)
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_brief(args):
+    """Rehydration: which window it is, what we asked it, last output, state."""
+    meta, _procs, fg, lines, total, det, agent = _snapshot(args.id)
+    quiet = _quiet_seconds(args.id, lines)
+    entry = _touch_state(args.id, lines, total, meta["title"])
+    out = {"ok": True, "id": args.id, "title": meta["title"], "tty": meta["tty"],
+           "size": f'{meta["cols"]}x{meta["rows"]}',
+           "state": _state_label(meta["busy"], det["waiting_for_input"]),
+           "busy": meta["busy"], "quiet_s": quiet, "agent": agent,
+           "login_required": _login_required(lines),
+           "foreground": fg, "cwd": _cwd_of(fg["pid"]) if fg else None,
+           "waiting_for_input": det["waiting_for_input"], "question": det["question"],
+           "options": det["options"],
+           "asked_recently": entry.get("asks", []),
+           "last_lines": _no_markers(lines[-args.lines:])}
+    if not entry.get("asks"):
+        out["note"] = "I have no memory of asking it anything: you opened it, or something else did"
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_search(args):
+    """Searches a text in every session: says which window it is in."""
+    pat = args.pattern.lower()
+    sessions = sessions_list()
+    found = []
+    for s in sessions:
+        try:
+            raw = _history(s["id"])
+        except SystemExit:
+            continue
+        total, lines = clean_lines(raw, 0)
+        lines = _no_markers(lines)
+        hits = [ln for ln in lines if pat in ln.lower()]
+        if hits:
+            found.append({"id": s["id"], "busy": s["busy"], "title": s["title"][:90],
+                          "tty": s["tty"], "matches": len(hits), "samples": hits[-args.lines:]})
+    out = {"ok": True, "pattern": args.pattern, "searched": len(sessions),
+           "found_in": len(found), "sessions": found}
+    if not found:
+        out["note"] = ("no session contains that text: it may be outside the lines "
+                       "kept in the scrollback, or it has not shown up yet")
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_read(args):
+    raw = _history(args.id)
+    total, all_lines = clean_lines(raw, 0)
+    _touch_state(args.id, all_lines, total)
+    all_lines = _no_markers(all_lines)
+    out = {"ok": True, "id": args.id, "busy": _busy(args.id), "total_lines": total}
+    if args.grep:
+        pat = args.grep.lower()
+        idx = [i for i, ln in enumerate(all_lines) if pat in ln.lower()]
+        shown, used = [], set()
+        for i in idx[-args.lines:]:
+            for j in range(max(0, i - args.context), min(len(all_lines), i + args.context + 1)):
+                if j not in used:
+                    used.add(j)
+                    shown.append(all_lines[j])
+        out.update({"grep": args.grep, "matches": len(idx), "shown": len(shown), "lines": shown})
+    else:
+        shown = all_lines[-args.lines:]
+        out.update({"shown": len(shown), "lines": shown})
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_delta(args):
+    """Only the new lines since the last read of that window.
+
+    Think of a loop: wait-for -> delta -> send -> delta. Each delta pays only
+    what showed up after, instead of paying for the whole scrollback again.
+    """
+    raw = _history(args.id)
+    total, lines = clean_lines(raw, 0)
+    prev = _load_state().get(str(args.id))
+    new, note = [], None
+
+    if args.reset or not prev or not lines:
+        new = lines[-args.lines:]
+        note = "first read of this session (or --reset): starting lines, not a delta"
+    else:
+        anchor = prev.get("last")
+        idx = next((i for i, ln in enumerate(lines) if _fingerprint(ln) == anchor), None)
+        if idx is None:
+            new = lines[-args.lines:]
+            note = ("I cannot find the last line read (the scrollback scrolled or the window "
+                    "was reused): here are the last lines")
+        else:
+            new = lines[idx + 1:]
+    clean = _no_markers(new)
+    inner = len(new) - len(clean)          # service lines of `run`, not content
+    shown = clean[-args.lines:]
+    if len(shown) < len(clean):
+        extra = f"{len(clean) - len(shown)} more lines: raise -n to see them all"
+        note = f"{note} | {extra}" if note else extra
+    _touch_state(args.id, lines, total)
+    out = {"ok": True, "id": args.id, "busy": _busy(args.id), "total_lines": total,
+           "new_lines": len(new), "shown": len(shown), "lines": shown}
+    if inner:
+        out["filtered_internal_lines"] = inner
+    if note:
+        out["note"] = note
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_send(args):
+    text = " ".join(args.text)
+    raw0 = _history(args.id)
+    total0, lines0 = clean_lines(raw0, 0)
+    _type(args.id, text)
+    _remember_ask(args.id, "send", text)
+    out = {"ok": True, "id": args.id, "sent": text[:200], "enter": True}
+    if args.no_enter:
+        out["note"] = ("--no-enter cannot be supported: do script always appends a Return, "
+                       "the text has been sent and executed")
+    if args.wait_for:
+        started = time.time()
+        deadline = started + args.timeout
+        matched, rawN = False, raw0
+        while True:
+            rawN = _history(args.id)
+            _t, linesNow = clean_lines(rawN, 0)
+            fresh = linesNow[len(lines0):] if len(linesNow) >= len(lines0) else linesNow
+            if any(args.wait_for.lower() in l.lower() for l in fresh):
+                matched = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(args.interval)
+        totalN, linesN = clean_lines(rawN, 0)
+        new = linesN[len(lines0):] if len(linesN) >= len(lines0) else linesN[-args.lines:]
+        new = _no_markers(new)
+        _touch_state(args.id, linesN, totalN)
+        out.update({"matched": matched, "pattern": args.wait_for,
+                    "waited_s": round(time.time() - started, 1), "busy": _busy(args.id),
+                    "new_lines": len(new), "lines": new[-args.lines:]})
+        if not matched:
+            out["note"] = (f"marker did not appear within {args.timeout}s: that does NOT mean it is "
+                           "finished, raise --timeout or look with status")
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_run(args):
+    """Sends a command, waits for it to finish, returns the exit code and ONLY its output.
+
+    One call instead of send + wait-for + read. It assumes that session
+    runs a shell prompt (not a TUI): if something else runs there,
+    the command would end up on the wrong stdin, so it refuses and says so.
+    """
+    cmd = " ".join(args.cmd).replace("\n", " ").strip()
+    if not cmd:
+        die("empty command")
+    meta = _window_meta(args.id)
+    procs = _procs_on_tty(meta["tty"])
+    fg = procs[-1] if procs else None
+    fg_name = os.path.basename((fg or {}).get("command", "").split()[0]) if fg else ""
+    if fg_name not in SHELLS:
+        die(f"session {args.id} is not at a shell prompt: it runs "
+            f"'{fg_name or '?'}'",
+            foreground=fg,
+            hint="for a TUI use send/read/wait-for; for a shell: termctl new --preset shell")
+
+    marker = f"__termctl_exit_{int(time.time() * 1000)}"
+    payload = f'{cmd}; echo "{marker}=$?"'
+    _type(args.id, payload)
+
+    started = time.time()
+    deadline = started + args.timeout
+    exit_code, lines = None, []
+    while True:
+        raw = _history(args.id)
+        total, lines = clean_lines(raw, 0)
+        hit = None
+        for ln in lines:
+            m = re.search(marker + r"=(\d+)", ln)
+            if m:
+                hit = m
+        if hit:
+            exit_code = int(hit.group(1))
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(1.0)
+
+    waited = round(time.time() - started, 1)
+    _remember_ask(args.id, "run", cmd, exit_code)
+    if exit_code is None:
+        _touch_state(args.id, lines, total, meta["title"])
+        print(json.dumps({"ok": True, "id": args.id, "cmd": cmd, "exit_code": None,
+                          "waited_s": waited, "busy": _busy(args.id),
+                          "note": f"no end marker within {args.timeout}s: the command "
+                                  "may still be running (raise --timeout)",
+                          "lines": _no_markers(lines[-args.lines:])}, ensure_ascii=False))
+        return
+
+    first = next((i for i, ln in enumerate(lines) if marker in ln), None)
+    last = next((i for i, ln in enumerate(lines) if re.search(marker + r"=(\d+)", ln)), None)
+    out_lines = lines[first + 1:last] if (first is not None and last is not None and last > first) else []
+    out_lines = _no_markers(out_lines)
+    shown = out_lines[-args.lines:]
+    _touch_state(args.id, lines, total, meta["title"])
+    out = {"ok": True, "id": args.id, "cmd": cmd, "exit_code": exit_code,
+           "waited_s": waited, "output_lines": len(out_lines), "shown": len(shown),
+           "output": shown}
+    if len(shown) < len(out_lines):
+        out["note"] = f"{len(out_lines) - len(shown)} more output lines: raise -n"
+    if not out_lines:
+        out["note"] = "command ran without output (or echo disabled in the shell)"
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_choose(args):
+    """Picks an entry of a TUI menu: arrows + Return, then waits for the screen to change.
+
+    Explicit: the agent decides (entry number or text), there is no
+    automatic go-ahead. If it sees no menu, it presses nothing and says so.
+    """
+    want = " ".join(args.what)
+    meta, _procs, _fg, lines, total, det, agent = _snapshot(args.id)
+    opts = det["options"]
+    if not opts:
+        die("in this session I see no numbered menu to choose from",
+            question=det.get("question"), last_lines=_no_markers(lines[-8:]),
+            hint="look with status/read: if it is a TUI without a menu use send or key")
+    target = None
+    if want.isdigit():
+        n = int(want)
+        target = next((i for i, o in enumerate(opts) if o["n"] == n), None)
+        if target is None and 1 <= n <= len(opts):
+            target = n - 1
+    else:
+        target = next((i for i, o in enumerate(opts) if want.lower() in o["text"].lower()), None)
+    if target is None:
+        die(f"no entry matches '{want}'", options=opts)
+
+    # ONE single write: the arrows, and the Return Terminal appends itself confirms.
+    # Sending them one per call would fire the Return after the first arrow
+    # (that is the bug that always picked the first entry of the menu).
+    # Where does the selection start? Agent menus mark the current entry (❯):
+    # without knowing that you would count arrows from the first entry and pick the wrong one.
+    start = det.get("selected")
+    start = start if isinstance(start, int) else 0
+    delta = target - start
+    if delta == 0:
+        _enter(args.id)
+        form = "no arrow"
+    else:
+        key_name = "down" if delta > 0 else "up"
+        data, form = _key_data(args.id, key_name, args.csi)
+        osa(f'tell application "Terminal" to do script {_osa_expr(data * abs(delta))} in tab 1 of window id {args.id}',
+            timeout=60)
+    _remember_ask(args.id, "choose", f"{opts[target]['n']}. {opts[target]['text']}")
+
+    started = time.time()
+    deadline = started + args.timeout
+    changed, last_fp = False, _fingerprint(lines[-1]) if lines else None
+    while True:
+        _m, _p, _f, lines2, total2, _d, _a = _snapshot(args.id)
+        if lines2 and _fingerprint(lines2[-1]) != last_fp:
+            changed = True
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(1.0)
+    _touch_state(args.id, lines2, total2, meta["title"])
+    out = {"ok": True, "id": args.id, "chosen": opts[target]["text"],
+           "chosen_number": opts[target]["n"], "screen_changed": changed, "arrow_form": form,
+           "from_selected": start, "moved": delta, "agent": agent,
+           "waited_s": round(time.time() - started, 1), "busy": _busy(args.id),
+           "last_lines": _no_markers(lines2[-8:])}
+    if not changed:
+        out["note"] = ("the screen did not change: the choice may not have landed, "
+                       "retry or look with read")
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_key(args):
+    form = _press(args.id, args.name, args.csi)
+    print(json.dumps({"ok": True, "id": args.id, "key": args.name.lower(), "form": form,
+                      "note": "Terminal appends a Return at the end: for sequences use choose"},
+                     ensure_ascii=False))
+
+
+def cmd_new(args):
+    if args.preset:
+        if args.preset not in PRESETS:
+            die(f"unknown preset: {args.preset}", available=sorted(PRESETS))
+        command = PRESETS[args.preset]
+    elif args.cmd:
+        command = args.cmd
+    else:
+        command = PRESETS["shell"]
+    if args.dir:
+        command = f'cd {json.dumps(args.dir)} && {command}'
+    script = f'''
+tell application "Terminal"
+    activate
+    do script {astr(command)}
+    delay 0.4
+    return (id of front window as text) & (ASCII character 31) & (tty of tab 1 of front window) & (ASCII character 31) & (name of front window as text)
+end tell
+'''
+    raw = osa(script, timeout=45)
+    parts = raw.split(US)
+    out = {"ok": True, "id": int(parts[0]), "tty": parts[1] if len(parts) > 1 else "",
+           "title": parts[2][:120] if len(parts) > 2 else "", "command": command}
+    if args.title:
+        osa(f'tell application "Terminal" to set custom title of tab 1 of window id {out["id"]} to {astr(args.title)}',
+            timeout=30)
+        out["title"] = args.title
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_title(args):
+    text = " ".join(args.text)
+    osa(f'tell application "Terminal" to set custom title of tab 1 of window id {args.id} to {astr(text)}',
+        timeout=30)
+    state = _load_state()
+    if str(args.id) in state:
+        state[str(args.id)]["title"] = text
+        _save_state(state)
+    print(json.dumps({"ok": True, "id": args.id, "title": text}, ensure_ascii=False))
+
+
+def cmd_close(args):
+    """Closes a window without a dialog popping up on the desktop.
+
+    If a TUI runs inside (`busy`), without --force it does NOT kill it: it just says so.
+    With --force it terminates the processes of that tty (so Terminal does not ask for a
+    confirmation) and then the window goes away by itself.
+    """
+    if not _window_exists(args.id):
+        die(f"no window with id {args.id}")
+    meta = _window_meta(args.id)
+    tty = meta["tty"]
+    method = None
+    if meta["busy"]:
+        try:                                    # try to exit the shell cleanly
+            _type(args.id, "exit")
+        except SystemExit:
+            pass
+        for _ in range(6):
+            if not _busy(args.id):
+                break
+            time.sleep(1)
+    if not _busy(args.id):
+        osa(f'tell application "Terminal" to close window id {args.id} saving no', timeout=30)
+        method = "closed"
+    elif not args.force:
+        print(json.dumps({"ok": True, "id": args.id, "closed": False, "busy": True,
+                          "tty": tty,
+                          "note": "there is an active process inside (a TUI does not answer exit): "
+                                  "close it yourself, or call again with --force to terminate it",
+                          "processes": _procs_on_tty(tty)[:4]}, ensure_ascii=False))
+        return
+    else:
+        procs = _procs_on_tty(tty)
+        for p in procs:
+            try:
+                os.kill(p["pid"], 15)
+            except Exception:
+                pass
+        for _ in range(5):
+            if not _procs_on_tty(tty):
+                break
+            time.sleep(1)
+        for p in _procs_on_tty(tty):
+            try:
+                os.kill(p["pid"], 9)
+            except Exception:
+                pass
+        for _ in range(5):
+            if not _window_exists(args.id):
+                break
+            time.sleep(1)
+        if _window_exists(args.id):
+            osa(f'tell application "Terminal" to close window id {args.id} saving no', timeout=30)
+            method = "closed"
+        else:
+            method = "terminated"
+    time.sleep(0.5)
+    gone = not _window_exists(args.id)
+    if gone:
+        state = _load_state()
+        state.pop(str(args.id), None)
+        _save_state(state)
+    print(json.dumps({"ok": True, "id": args.id, "closed": gone,
+                      "method": method, "tty": tty}, ensure_ascii=False))
+
+
+def cmd_watch(args):
+    deadline = time.time() + args.timeout
+    last, stable_since, total, tail = None, None, 0, []
+    while True:
+        raw = _history(args.id)
+        total, tail = clean_lines(raw, args.lines)
+        if raw == last:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= args.idle:
+                break
+        else:
+            stable_since = None
+            last = raw
+        if time.time() >= deadline:
+            break
+        time.sleep(2)
+    _touch_state(args.id, tail, total)
+    print(json.dumps({"ok": True, "id": args.id, "busy": _busy(args.id),
+                      "stable": stable_since is not None, "total_lines": total,
+                      "lines": _no_markers(tail)}, ensure_ascii=False))
+
+
+def cmd_wait_for(args):
+    """Waits for a marker to appear in the scrollback (e.g. 'Task complete').
+
+    More reliable than a sleep: it returns as soon as the marker is there, and on timeout it
+    says so (`matched: false`) instead of letting you believe it finished.
+    """
+    started = time.time()
+    deadline = started + args.timeout
+    raw = ""
+    while True:
+        raw = _history(args.id)
+        if args.pattern.lower() in raw.lower():
+            total, tail = clean_lines(raw, args.lines)
+            _touch_state(args.id, tail, total)
+            print(json.dumps({"ok": True, "id": args.id, "matched": True, "pattern": args.pattern,
+                              "waited_s": round(time.time() - started, 1), "busy": _busy(args.id),
+                              "total_lines": total, "shown": len(tail),
+                              "lines": _no_markers(tail)}, ensure_ascii=False))
+            return
+        if time.time() >= deadline:
+            total, tail = clean_lines(raw, args.lines)
+            _touch_state(args.id, tail, total)
+            print(json.dumps({"ok": True, "id": args.id, "matched": False, "pattern": args.pattern,
+                              "waited_s": round(time.time() - started, 1), "busy": _busy(args.id),
+                              "note": "marker did not appear within the timeout: the session is NOT necessarily "
+                                      "finished, raise --timeout or read with read",
+                              "total_lines": total, "shown": len(tail),
+                              "lines": _no_markers(tail)}, ensure_ascii=False))
+            return
+        time.sleep(args.interval)
+
+
+def cmd_ask(args):
+    """A prompt to a CLI agent, in a throwaway window, in one call.
+
+    Opens a shell session, runs the one-shot (`claude -p` / `copilot -p`),
+    takes exit code and output and closes the window: for a direct question you
+    do not need to keep a TUI around, and sessions do not pile up.
+    Authentication is not improvised: if the agent says it is not
+    authenticated, that is reported as is (the user does the /login).
+    """
+    prompt = " ".join(args.prompt).replace("\n", " ").strip()
+    if not prompt:
+        die("prompt vuoto")
+    me = os.path.abspath(__file__)
+
+    def call(*a, **kw):
+        to = kw.get("timeout", 900)
+        try:
+            proc = subprocess.run([sys.executable, me, *a], capture_output=True, text=True,
+                                  timeout=to, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"timeout after {to}s"}
+        lines = (proc.stdout or "").strip().splitlines()
+        try:
+            return json.loads(lines[-1]) if lines else {"ok": False,
+                                                        "error": (proc.stderr or "")[:200]}
+        except Exception:
+            return {"ok": False, "error": (proc.stdout or "")[-200:]}
+
+    new_args = ["new", "--preset", "shell", "--title", f"termctl ask ({args.agent})"]
+    if args.dir:
+        new_args += ["--dir", args.dir]
+    win = call(*new_args, timeout=120)
+    if not win.get("id"):
+        print(json.dumps({"ok": False, "error": "could not open the session", "detail": win},
+                         ensure_ascii=False))
+        return
+    wid = str(win["id"])
+    cmd = f"{args.agent} -p " + shlex.quote(prompt)
+    if args.model:
+        cmd += " --model " + shlex.quote(args.model)
+    if args.agent == "copilot" and args.reasoning:
+        cmd += " --reasoning-effort " + shlex.quote(args.reasoning)
+    res = call("run", wid, cmd, "--timeout", str(int(args.timeout)), timeout=args.timeout + 120)
+    closed = None
+    if not args.keep:
+        closed = call("close", wid, "--force", timeout=90).get("closed")
+    out = {"ok": bool(res.get("ok")), "agent": args.agent, "model": args.model or "(default)",
+           "cmd": cmd, "exit_code": res.get("exit_code"), "waited_s": res.get("waited_s"),
+           "output": res.get("output", []), "window": win.get("id"), "window_closed": closed}
+    low = " ".join(out["output"]).lower()
+    if "not logged in" in low or "/login" in low:
+        out["login_required"] = True
+        out["note"] = ("the agent is not authenticated: it needs /login, do it yourself "
+                       "(I do not try credentials)")
+    elif res.get("note"):
+        out["note"] = res["note"]
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_presets(_args):
+    print(json.dumps({"ok": True, "presets": PRESETS, "yolo": list(YOLO_PRESETS),
+                      "keys": sorted(KEYS),
+                      "nota": "the presets listed in 'yolo' remove every confirmation: use them only if "
+                              "the user asks for it explicitly"},
+                     ensure_ascii=False))
+
+
+def _audit(argv):
+    """Records who invoked termctl: used to verify that an agent really uses it."""
+    try:
+        d = os.path.expanduser("~/.local/state")
+        os.makedirs(d, exist_ok=True)
+        ppid = os.getppid()
+        parent = "?"
+        try:
+            parent = subprocess.run(["ps", "-o", "command=", "-p", str(ppid)],
+                                    capture_output=True, text=True, timeout=5).stdout.strip()[:140]
+        except Exception:
+            pass
+        with open(os.path.join(d, "termctl.log"), "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} termctl {' '.join(argv)} | parent={parent}\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# MCP server (stdio): one tool per verb, so they can be switched on and off one at
+# a time with `hermes tools enable/disable termctl:<verb>`. It reimplements
+# nothing: it calls the same cmd_* of the CLI and captures their JSON.
+# ---------------------------------------------------------------------------
+
+MCP_PROTOCOL = "2024-11-05"
+_I, _S = {"type": "integer"}, {"type": "string"}
+
+
+def _ns(**kw):
+    return argparse.Namespace(**kw)
+
+
+def _schema(props, required=()):
+    return {"type": "object", "properties": props, "required": list(required)}
+
+
+def _as_list(v):
+    return v if isinstance(v, list) else [str(v)]
+
+
+# name -> (description, schema, argument builder, function)
+MCP_TOOLS = {}
+
+
+def _tool(name, desc, schema, build, func):
+    MCP_TOOLS[name] = {"description": desc, "inputSchema": schema, "build": build, "func": func}
+
+
+_tool("list", "Open Terminal.app windows (id, tty, busy, title).", _schema({}),
+      lambda a: _ns(), cmd_list)
+_tool("brief", "Which session an id is, what we asked it, state, last output.",
+      _schema({"id": _I, "lines": _I}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), lines=int(a.get("lines", 15))), cmd_brief)
+_tool("status", "Working, parked at the prompt, or waiting for an answer? Gives question and options.",
+      _schema({"id": _I, "lines": _I, "stuck": _I}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), lines=int(a.get("lines", 10)), stuck=int(a.get("stuck", 120))),
+      cmd_status)
+_tool("info", "Session details: processes on the tty, cwd, agent, last lines.",
+      _schema({"id": _I, "lines": _I}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), lines=int(a.get("lines", 8))), cmd_info)
+_tool("search", "Searches a text in every session and says which one has it.",
+      _schema({"pattern": _S, "lines": _I}, ["pattern"]),
+      lambda a: _ns(pattern=a["pattern"], lines=int(a.get("lines", 3))), cmd_search)
+_tool("read", "Last lines of a session, with optional filter and context lines.",
+      _schema({"id": _I, "lines": _I, "grep": _S, "context": _I}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), lines=int(a.get("lines", 40)), grep=a.get("grep"),
+                    context=int(a.get("context", 2))), cmd_read)
+_tool("delta", "Only the NEW lines since the last read of that session.",
+      _schema({"id": _I, "lines": _I, "reset": {"type": "boolean"}}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), lines=int(a.get("lines", 60)), reset=bool(a.get("reset"))),
+      cmd_delta)
+_tool("send", "Writes the text into the session and presses Return; with wait_for it waits for a marker.",
+      _schema({"id": _I, "text": _S, "lines": _I, "wait_for": _S, "timeout": _I, "interval": _I},
+              ["id", "text"]),
+      lambda a: _ns(id=int(a["id"]), text=_as_list(a["text"]), lines=int(a.get("lines", 40)),
+                    no_enter=False, wait=2.0, wait_for=a.get("wait_for"),
+                    timeout=float(a.get("timeout", 600)), interval=float(a.get("interval", 2))),
+      cmd_send)
+_tool("run", "Sends a command to a shell and returns the exit code + only its output.",
+      _schema({"id": _I, "cmd": _S, "lines": _I, "timeout": _I}, ["id", "cmd"]),
+      lambda a: _ns(id=int(a["id"]), cmd=_as_list(a["cmd"]), lines=int(a.get("lines", 60)),
+                    timeout=float(a.get("timeout", 120))), cmd_run)
+_tool("choose", "Answers a TUI menu (entry number or part of the text).",
+      _schema({"id": _I, "what": _S, "timeout": _I}, ["id", "what"]),
+      lambda a: _ns(id=int(a["id"]), what=_as_list(a["what"]), timeout=float(a.get("timeout", 20)),
+                    csi=bool(a.get("csi"))), cmd_choose)
+_tool("key", "Sends one single key (arrows, ctrl-*, esc, tab...).",
+      _schema({"id": _I, "name": {"type": "string", "enum": sorted(KEYS)}}, ["id", "name"]),
+      lambda a: _ns(id=int(a["id"]), name=a["name"], csi=bool(a.get("csi"))), cmd_key)
+_tool("new", "Opens a new window (agent preset or shell) and returns its id.",
+      _schema({"preset": {"type": "string", "enum": sorted(PRESETS)}, "cmd": _S, "dir": _S,
+               "title": _S}),
+      lambda a: _ns(preset=a.get("preset"), cmd=a.get("cmd"), dir=a.get("dir"), title=a.get("title")),
+      cmd_new)
+_tool("title", "Renames a window: so `list` says which one it is.",
+      _schema({"id": _I, "text": _S}, ["id", "text"]),
+      lambda a: _ns(id=int(a["id"]), text=_as_list(a["text"])), cmd_title)
+_tool("close", "Closes a window (force: also terminates the processes running in it).",
+      _schema({"id": _I, "force": {"type": "boolean"}}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), force=bool(a.get("force"))), cmd_close)
+_tool("watch", "Waits for the output to settle (idle seconds) and returns the last lines.",
+      _schema({"id": _I, "lines": _I, "idle": _I, "timeout": _I}, ["id"]),
+      lambda a: _ns(id=int(a["id"]), lines=int(a.get("lines", 40)), idle=float(a.get("idle", 4)),
+                    timeout=float(a.get("timeout", 120))), cmd_watch)
+_tool("wait_for", "Waits for a marker to appear in that session's scrollback.",
+      _schema({"id": _I, "pattern": _S, "lines": _I, "interval": _I, "timeout": _I},
+              ["id", "pattern"]),
+      lambda a: _ns(id=int(a["id"]), pattern=a["pattern"], lines=int(a.get("lines", 40)),
+                    interval=float(a.get("interval", 2)), timeout=float(a.get("timeout", 300))),
+      cmd_wait_for)
+_tool("ask", "A direct question to a CLI agent (claude/copilot) in a throwaway window.",
+      _schema({"prompt": _S, "agent": {"type": "string", "enum": ["claude", "copilot"]},
+               "model": _S, "reasoning": _S, "dir": _S, "timeout": _I,
+               "keep": {"type": "boolean"}}, ["prompt"]),
+      lambda a: _ns(prompt=_as_list(a["prompt"]), agent=a.get("agent", "claude"),
+                    model=a.get("model"), reasoning=a.get("reasoning", "high"), dir=a.get("dir"),
+                    timeout=float(a.get("timeout", 300)), keep=bool(a.get("keep"))), cmd_ask)
+
+
+def _run_captured(func, ns):
+    """Runs a verb capturing its JSON: stdout stays JSON-RPC only."""
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        func(ns)
+    except SystemExit:                    # die() prints the error and calls sys.exit
+        pass
+    except Exception as e:
+        sys.stdout = old
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    finally:
+        sys.stdout = old
+    lines = [l for l in buf.getvalue().strip().splitlines() if l.strip()]
+    return lines[-1] if lines else json.dumps({"ok": False, "error": "no output"},
+                                              ensure_ascii=False)
+
+
+def _mcp_write(obj):
+    sys.__stdout__.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.__stdout__.flush()
+
+
+def _mcp_result(mid, text, is_error=False):
+    _mcp_write({"jsonrpc": "2.0", "id": mid,
+                "result": {"content": [{"type": "text", "text": text}], "isError": is_error}})
+
+
+def cmd_mcp(_args):
+    """MCP server on stdio (one JSON-RPC message per line). In stdout ONLY MCP messages."""
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        mid, method = msg.get("id"), msg.get("method", "")
+        if method == "initialize":
+            ver = (msg.get("params") or {}).get("protocolVersion") or MCP_PROTOCOL
+            _mcp_write({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": ver,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "termctl", "version": "1.0.0"}}})
+        elif method in ("notifications/initialized", "initialized"):
+            continue
+        elif method == "ping":
+            _mcp_write({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "tools/list":
+            _mcp_write({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+                {"name": n, "description": t["description"], "inputSchema": t["inputSchema"]}
+                for n, t in MCP_TOOLS.items()]}})
+        elif method == "tools/call":
+            params = msg.get("params") or {}
+            name, args = params.get("name"), (params.get("arguments") or {})
+            if name not in MCP_TOOLS:
+                _mcp_write({"jsonrpc": "2.0", "id": mid,
+                            "error": {"code": -32602, "message": f"unknown tool: {name}"}})
+                continue
+            tool = MCP_TOOLS[name]
+            _audit(["mcp:call", str(name)])      # tracks who uses what, also over MCP
+            try:
+                ns = tool["build"](args)
+            except (KeyError, TypeError, ValueError) as e:
+                _mcp_result(mid, json.dumps({"ok": False, "error": f"invalid arguments: {e}"},
+                                            ensure_ascii=False), True)
+                continue
+            out = _run_captured(tool["func"], ns)
+            try:
+                is_err = not json.loads(out).get("ok", False)
+            except Exception:
+                is_err = True
+            _mcp_result(mid, out, is_err)
+        elif mid is not None:
+            _mcp_write({"jsonrpc": "2.0", "id": mid,
+                        "error": {"code": -32601, "message": f"unsupported method: {method}"}})
+    return 0
+
+
+def main():
+    if not os.path.exists(OSA):
+        die("osascript not found")
+    _audit(sys.argv[1:])
+    p = argparse.ArgumentParser(prog="termctl", description="drives Terminal.app with one command per action")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list").set_defaults(func=cmd_list)
+    sub.add_parser("mcp", help="MCP server on stdio (for `hermes mcp add`)").set_defaults(func=cmd_mcp)
+    sub.add_parser("presets").set_defaults(func=cmd_presets)
+
+    i = sub.add_parser("info", help="identify a session: processes, cwd, last lines")
+    i.add_argument("id", type=int)
+    i.add_argument("-n", "--lines", type=int, default=8)
+    i.set_defaults(func=cmd_info)
+
+    st = sub.add_parser("status", help="working / idle / waiting for an answer?")
+    st.add_argument("id", type=int)
+    st.add_argument("-n", "--lines", type=int, default=10)
+    st.add_argument("--stuck", type=int, default=120, help="seconds after which it is reported as 'stuck'")
+    st.set_defaults(func=cmd_status)
+
+    br = sub.add_parser("brief", help="rehydration: what this session is and where it was")
+    br.add_argument("id", type=int)
+    br.add_argument("-n", "--lines", type=int, default=15)
+    br.set_defaults(func=cmd_brief)
+
+    f = sub.add_parser("search", help="searches a text in every session")
+    f.add_argument("pattern")
+    f.add_argument("-n", "--lines", type=int, default=3, help="example lines per session")
+    f.set_defaults(func=cmd_search)
+
+    r = sub.add_parser("read")
+    r.add_argument("id", type=int)
+    r.add_argument("-n", "--lines", type=int, default=DEFAULT_LINES)
+    r.add_argument("--grep", help="shows only the lines containing this text")
+    r.add_argument("-C", "--context", type=int, default=2,
+                   help="context lines around every --grep match (default 2)")
+    r.set_defaults(func=cmd_read)
+
+    d = sub.add_parser("delta", help="only the new lines since the last read")
+    d.add_argument("id", type=int)
+    d.add_argument("-n", "--lines", type=int, default=60)
+    d.add_argument("--reset", action="store_true", help="forgets the resume point")
+    d.set_defaults(func=cmd_delta)
+
+    s = sub.add_parser("send")
+    s.add_argument("id", type=int)
+    s.add_argument("text", nargs="+")
+    s.add_argument("-n", "--lines", type=int, default=DEFAULT_LINES)
+    s.add_argument("--no-enter", action="store_true")
+    s.add_argument("--wait", type=float, default=2.0, help="pause before the Return (default 2s)")
+    s.add_argument("--wait-for", help="after the Return, waits for this marker (one single call)")
+    s.add_argument("--timeout", type=float, default=600.0)
+    s.add_argument("--interval", type=float, default=2.0)
+    s.set_defaults(func=cmd_send)
+
+    u = sub.add_parser("run", help="sends a command, waits, returns exit code + output")
+    u.add_argument("id", type=int)
+    u.add_argument("cmd", nargs="+")
+    u.add_argument("-n", "--lines", type=int, default=60)
+    u.add_argument("--timeout", type=float, default=120.0)
+    u.set_defaults(func=cmd_run)
+
+    ak = sub.add_parser("ask", help="a prompt to a CLI agent, in a throwaway window")
+    ak.add_argument("prompt", nargs="+")
+    ak.add_argument("--agent", choices=["claude", "copilot"], default="claude")
+    ak.add_argument("--model", help="claude: opus|fable|sonnet — copilot: claude-opus-5.5")
+    ak.add_argument("--reasoning", default="high", help="copilot only: --reasoning-effort")
+    ak.add_argument("--dir", help="working directory of the session")
+    ak.add_argument("--timeout", type=float, default=300.0)
+    ak.add_argument("--keep", action="store_true", help="leaves the window open to look at it")
+    ak.set_defaults(func=cmd_ask)
+
+    c = sub.add_parser("choose", help="picks an entry of a TUI menu")
+    c.add_argument("id", type=int)
+    c.add_argument("what", nargs="+", help="the entry number (e.g. 2) or part of its text")
+    c.add_argument("--timeout", type=float, default=20.0, help="how long to wait for the screen to change")
+    c.add_argument("--csi", action="store_true", help="forza le frecce in forma CSI")
+    c.set_defaults(func=cmd_choose)
+
+    k = sub.add_parser("key")
+    k.add_argument("id", type=int)
+    k.add_argument("name")
+    k.add_argument("--csi", action="store_true",
+                   help="forces the CSI form (ESC [ B) instead of the terminfo one")
+    k.set_defaults(func=cmd_key)
+
+    n = sub.add_parser("new")
+    n.add_argument("--preset", choices=sorted(PRESETS))
+    n.add_argument("--cmd")
+    n.add_argument("--dir")
+    n.add_argument("--title", help="window name (immediately readable in list)")
+    n.set_defaults(func=cmd_new)
+
+    ti = sub.add_parser("title", help="renames the window")
+    ti.add_argument("id", type=int)
+    ti.add_argument("text", nargs="+")
+    ti.set_defaults(func=cmd_title)
+
+    cl = sub.add_parser("close", help="closes the window")
+    cl.add_argument("id", type=int)
+    cl.add_argument("--force", action="store_true", help="also terminates the processes running in it")
+    cl.set_defaults(func=cmd_close)
+
+    w = sub.add_parser("watch")
+    w.add_argument("id", type=int)
+    w.add_argument("-n", "--lines", type=int, default=DEFAULT_LINES)
+    w.add_argument("--idle", type=float, default=4.0, help="seconds of quiet output = finished")
+    w.add_argument("--timeout", type=float, default=120.0)
+    w.set_defaults(func=cmd_watch)
+
+    a = sub.add_parser("wait-for")
+    a.add_argument("id", type=int)
+    a.add_argument("pattern")
+    a.add_argument("-n", "--lines", type=int, default=DEFAULT_LINES)
+    a.add_argument("--interval", type=float, default=2.0, help="how many seconds between checks")
+    a.add_argument("--timeout", type=float, default=300.0)
+    a.set_defaults(func=cmd_wait_for)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
